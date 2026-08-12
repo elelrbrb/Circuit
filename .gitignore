@@ -23,3 +23,8 @@ build/
 # Temp
 *.tmp
 *.log
+
+# SQLite databases
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

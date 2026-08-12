@@ -443,56 +443,79 @@ price는 문자열이므로 직접 ORDER BY 불가. 첫 단가를 SQL 런타임�
 
 tscircuit/jlcsearch는 이 DB와 동일한 원본(yaqwsx/jlcparts)을 사용하며, derived tables를 통해 카테고리별 파라미터를 정규화함.
 
-**중요: jlcsearch의 attributes 데이터 흐름**
+**jlcsearch의 실제 production build 경로 (source of truth: `scripts/build-derived-sync-db.ts`)**
 
-jlcsearch의 derived table parser가 읽는 `extra.attributes`는 단순히 `jlc_components.attributes`가 아닙니다. 실제 데이터 흐름:
+jlcsearch는 yaqwsx/jlcparts의 source-db-v2를 ATTACH하고, SQL 뷰에서 두 테이블의 attributes를 `json_patch`로 병합한 뒤 derived table을 생성합니다:
 
-1. yaqwsx/jlcparts의 `sourceDb.py` → `_rowToComponent()`가 DB에서 부품을 읽을 때:
-   - `jlc_components.attributes` → `jlc_extra.attributes`로 매핑
-   - `lcsc_components.attributes` → `extra.attributes`로 매핑
-
-2. yaqwsx/jlcparts의 `datatables.py` → `_mergeAttributes()`가 두 소스를 병합:
-   ```python
-   def _mergeAttributes(component):
-       attr = dict(_extraAttributes(component.get("extra", {})))   # lcsc_components.attributes (기본)
-       for key, value in _jlcAttributes(component.get("jlc_extra", {})).items():  # jlc_components.attributes
-           if value in ["", "-"]:
-               continue
-           attr[key] = value  # jlc_extra가 extra를 덮어씀 (override)
-       return attr
-   ```
-
-3. 병합된 attributes가 최종 `components` 테이블의 `extra` JSON에 포함됨
-
-4. jlcsearch의 derived table parser (`resistor.ts`, `capacitor.ts` 등)는 이 **병합된 extra.attributes**를 읽음:
-   ```typescript
-   const extra = JSON.parse(c.extra ?? "{}")
-   const rawResistance = extra?.attributes?.["Resistance"]
-   ```
-
-**우리 DB에서의 차이점**:
-
-우리 `jlcpcb-components.sqlite3`에는:
-- `jlc_components.attributes` — JLCPCB API에서 온 속성 (key명: "Resistance", "Power(Watts)" 등)
-- `lcsc_components.attributes` — LCSC 웹에서 온 속성 (key명: 비슷하지만 약간 다름, 예: "DC Resistance" vs "DC Resistance(DCR)")
-
-**jlcsearch parser를 직접 재사용할 경우**:
-- `jlc_components.attributes`만 사용: 대부분의 카테고리에서 주요 파라미터가 포함되어 있으므로 **Resistor, Capacitor 등 기본 카테고리는 동작함**. 단, MCU 등 일부 카테고리에서는 LCSC 측 속성이 더 풍부할 수 있음.
-- `lcsc_components.attributes`와 병합 사용: 원본 jlcparts와 동일한 결과. JOIN으로 구현 가능 (jlc_components의 63%가 lcsc_components에 매핑됨).
-
-**Resistor 예시** (우리 DB의 `jlc_components.attributes` 직접 사용 가능):
-```json
-{"Resistance":"10kΩ","Tolerance":"±1%","Power(Watts)":"100mW","Type":"Thick Film Resistor",...}
+```sql
+-- build-derived-sync-db.ts에서 생성하는 TEMP VIEW components
+CREATE TEMP VIEW components AS
+SELECT
+  ...
+  json_object(
+    'attributes',
+    json(
+      json_patch(
+        CASE WHEN json_valid(j.attributes) THEN j.attributes ELSE '{}' END,
+        CASE WHEN json_valid(l.attributes) THEN l.attributes ELSE '{}' END
+      )
+    ),
+    ...
+  ) AS extra
+FROM source.jlc_components AS j
+LEFT JOIN source.lcsc_components AS l ON l.lcsc = j.lcsc
+WHERE j.present = 1
+  AND j.last_on_stock >= unixepoch('now', '-1 year');
 ```
-→ jlcsearch의 `parseAndConvertSiUnit("10kΩ")` → 10000 (바로 적용 가능)
 
-**Capacitor 예시** (우리 DB의 `jlc_components.attributes` 직접 사용 가능):
-```json
-{"Capacitance":"100nF","Voltage Rating":"50V","Temperature Coefficient":"X7R","Tolerance":"±10%"}
+그리고 derived table parser (`resistor.ts`, `capacitor.ts` 등)는 이 뷰의 `extra` 컬럼을 읽음:
+```typescript
+const extra = JSON.parse(c.extra ?? "{}")
+const rawResistance = extra?.attributes?.["Resistance"]
 ```
-→ jlcsearch의 `parseAndConvertSiUnit("100nF")` → 0.0000001 (바로 적용 가능)
 
-**결론**: jlcsearch의 SI unit 파서와 카테고리별 key 매핑은 `jlc_components.attributes`에 직접 적용 가능하나, 일부 카테고리에서는 병합된 데이터를 쓸 때보다 속성이 빠져있을 수 있음. 나중에 파라미터 필터를 구현할 때 카테고리별로 `jlc_components.attributes`만으로 충분한지 검증이 필요함.
+**이전 보고서에서 언급한 yaqwsx/jlcparts의 `datatables.py` → `_mergeAttributes()`는 jlcparts 자체 프론트엔드 빌드 경로이며, jlcsearch의 production 경로가 아닙니다.** jlcsearch는 SQL 레벨에서 `json_patch`를 직접 사용합니다.
+
+**json_patch 병합 우선순위 (SQLite 실행으로 확인)**
+
+`json_patch(target, patch)`는 RFC 7396 JSON Merge Patch:
+- 공통 key: **patch (두 번째 인자 = lcsc_components.attributes)가 target (jlc_components.attributes)를 덮어씀**
+- target에만 있는 key: 유지
+- patch에만 있는 key: 추가
+- patch에서 값이 null: 해당 key 삭제
+
+```
+json_patch('{"x":"JLC"}', '{"x":"LCSC"}')           → {"x":"LCSC"}
+json_patch('{"x":"JLC","y":"only_jlc"}', '{"z":"only_lcsc"}') → {"x":"JLC","y":"only_jlc","z":"only_lcsc"}
+json_patch('{"x":"JLC"}', '{}')                     → {"x":"JLC"}
+```
+
+**실제 DB 검증 (C1093, Resistor)**:
+| key | jlc_components | lcsc_components | merged (최종) |
+|-----|:---:|:---:|:---:|
+| Resistance | 36Ω | 36Ω | 36Ω |
+| Tolerance | ±5% | ±5% | ±5% |
+| Type | Thick Film Resistor | Thick Film Resistors | **Thick Film Resistors** (lcsc 우선) |
+| Voltage-Supply(Max) | 50V | — | 50V (jlc only, 유지) |
+| Overload Voltage (Max) | — | 75V | 75V (lcsc only, 추가) |
+
+**우리 DB에서의 실질적 영향**:
+
+jlcsearch build 경로: `json_patch(j.attributes, l.attributes)` → lcsc가 jlc를 덮어씀.
+
+우리 DB에서 `jlc_components.attributes`만 사용할 경우:
+- **주요 파라미터 (Resistance, Capacitance, Voltage Rating 등)**: 대부분 jlc에 이미 존재하며 값도 동일 → 직접 사용 가능
+- **lcsc에만 있는 추가 key** (예: "Overload Voltage (Max)", "Operating Temperature Range"): 누락됨
+- **공통 key에서 lcsc와 값이 다른 경우** (예: "Type" 필드의 미세한 표현 차이): jlc 값이 사용됨 (jlcsearch와 약간 다름)
+
+`json_patch(j.attributes, l.attributes)`를 사용할 경우:
+- jlcsearch와 동일한 결과
+- 단, `lcsc_components`에 매핑되는 부품만 해당 (jlc_components의 63%)
+- 매핑 안 되는 37%는 `jlc_components.attributes`만 사용
+
+**Resistor/Capacitor 핵심 key 가용성** (jlc_components.attributes만으로):
+- Resistance ✓, Capacitance ✓, Voltage Rating ✓, Tolerance ✓, Power(Watts) ✓, Temperature Coefficient ✓
+- 이들은 jlc와 lcsc 양쪽에 동일하게 존재하므로 **jlc_components.attributes만으로 파라미터 파싱이 정상 동작함**
 
 ---
 

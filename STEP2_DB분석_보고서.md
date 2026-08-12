@@ -307,7 +307,24 @@ lcsc_components에도 별도의 attributes가 있음. LCSC 웹사이트에서 �
 | expand | 0 | 1 | 990 |
 | base | 0 | 0 | 350 |
 
-**분석**: `basic` 컬럼은 CDFER의 generate-database.py에서 나중에 추가된 것으로 보이며 모든 값이 0. `library_type='base'`가 실질적 Basic 부품을 나타내지만 350개뿐. 이는 CDFER가 stock >= 5 필터를 적용한 후의 결과이므로, Basic 부품 대부분이 재고 부족으로 제외되었거나, 원본 데이터의 library_type 매핑에 문제가 있을 수 있음.
+**분석**: 
+
+- `basic` 컬럼은 CDFER의 generate-database.py에서 추가된 컬럼이지만, 별도의 CSV 파일(basic/preferred parts 목록)에 있는 component_code에 대해서만 UPDATE하는 방식. 현재 DB에서는 전부 0 — 이는 해당 UPDATE 로직이 이 SQLite에 적용되지 않았거나, 매칭되는 코드가 없었을 수 있음.
+- `library_type='base'`가 350개 존재: JLCPCB에서 Basic으로 지정된 부품 중 재고 5개 이상인 것.
+- tscircuit/jlcsearch는 `library_type`을 기준으로 Basic을 판단: `Boolean(c.basic)` 대신 `library_type` 필드에서 변환.
+
+**우리 DB에서 Basic 판정의 source of truth**:
+
+`library_type` 컬럼이 source of truth. 근거:
+1. `basic` 컬럼은 전부 0이므로 정보가 없음
+2. `library_type='base'`는 원본 JLCPCB API에서 직접 가져온 값 (yaqwsx/jlcparts의 jlcpcb.py에서 `_normalizeLibraryType`으로 변환: "basic"→"base", "extended"→"expand")
+3. tscircuit/jlcsearch도 `library_type`을 기준으로 `is_basic` 계산: `is_basic: Boolean(c.basic)` — 여기서 `c.basic`은 yaqwsx/jlcparts가 `library_type == "base"`로 설정한 boolean 필드
+
+따라서 우리 프로젝트에서는:
+- **Basic 부품**: `library_type = 'base'` (350개)
+- **Extended 부품**: `library_type = 'expand'` (632,991개)
+- **Preferred 부품**: `preferred = 1` (990개)
+- `basic` 컬럼은 무시
 
 ---
 
@@ -342,18 +359,52 @@ FTS5 테이블 구조(schema)만 존재하고 실제 데이터가 채워지지 �
 
 ### 동작 확인된 쿼리 패턴
 
-| 기능 | 실행 시간 | SQL 예제 | 비고 |
-|------|----------|---------|------|
-| category 필터 | 0.3ms | `WHERE category='Capacitors'` | 매우 빠름 (PK 순서 활용) |
-| subcategory 필터 | 0.1ms | `WHERE category='Resistors' AND subcategory='Chip Resistor...'` | 매우 빠름 |
-| manufacturer 필터 | 3.1ms | `WHERE manufacturer='Texas Instruments'` | 빠름 |
-| package 필터 | 0.3ms | `WHERE package='0603'` | 빠름 |
-| LIMIT/OFFSET | 2.3ms | `LIMIT 5 OFFSET 100` | 정상 |
-| stock 정렬 | 1,208ms | `ORDER BY stock DESC` | 느림 (인덱스 없음) |
-| 가격 정렬 | 1,844ms | `ORDER BY first_price` (계산 컬럼) | 느림 (매번 파싱) |
-| 복합 조건 + 정렬 | 1,098ms | `WHERE category=? AND package=? ORDER BY stock DESC` | 느림 |
-| keyword (LIKE) | 1,500~1,800ms | `WHERE mfr LIKE '%...%' OR description LIKE '%...%'` | 매우 느림 |
-| keyword (FTS) | 작동 안 함 | FTS 인덱스 비어있음 | — |
+**중요: 모든 필터 쿼리는 SCAN jlc_components (풀 테이블 스캔)**
+
+EXPLAIN QUERY PLAN 실행 결과, 현재 DB에는 일반 인덱스가 전혀 없으며 모든 WHERE 절은 전체 테이블을 스캔합니다.
+
+```
+EXPLAIN QUERY PLAN SELECT * FROM jlc_components WHERE category='Capacitors' LIMIT 5
+→ SCAN jlc_components
+
+EXPLAIN QUERY PLAN SELECT * FROM jlc_components WHERE manufacturer='Texas Instruments' LIMIT 5
+→ SCAN jlc_components
+
+EXPLAIN QUERY PLAN SELECT * FROM jlc_components ORDER BY stock DESC LIMIT 5
+→ SCAN jlc_components + USE TEMP B-TREE FOR ORDER BY
+```
+
+이전 분석에서 category 필터가 0.1~0.3ms로 "매우 빠르다"고 판단한 것은 **LIMIT 5가 걸린 짧은 쿼리에서 우연히 빠른 결과를 반환한 것**이며, 실제로는:
+
+| 쿼리 유형 | LIMIT 5 시간 | COUNT(*) 시간 (풀 스캔) |
+|----------|:--------:|:--------:|
+| category 필터 | 0.3ms | **1,261ms** |
+| manufacturer 필터 | 3.1ms | **1,103ms** |
+| package 필터 | 0.3ms | **1,251ms** |
+| category + subcategory | 0.1ms | **1,649ms** |
+
+LIMIT 5 + 필터 조합이 빨라 보이는 이유: SQLite가 PK 순서로 스캔하다 조건 일치하는 첫 5건을 빠르게 찾기 때문. 하지만 페이지네이션(큰 OFFSET), 결과 수 카운트, 정렬이 필요하면 풀 스캔이 발생.
+
+### 큰 OFFSET 성능
+
+| OFFSET | 실행 시간 |
+|--------|----------|
+| 0 | 0.3ms |
+| 1,000 | 32.9ms |
+| 50,000 | 694.3ms |
+| 90,000 | 1,221ms |
+
+### 복합 조건 + 정렬
+
+| 쿼리 | 실행 시간 | EXPLAIN |
+|------|----------|---------|
+| `WHERE category='Capacitors' ORDER BY stock DESC LIMIT 5` | 1,271ms | SCAN + TEMP B-TREE |
+| `ORDER BY stock DESC LIMIT 5` (전체) | 1,208ms | SCAN + TEMP B-TREE |
+
+**결론**: 현재 DB에서는 인덱스가 전혀 없으므로:
+- 첫 페이지(LIMIT 5, OFFSET 0) → 빠름 (우연)
+- 페이지네이션, 정렬, COUNT → **항상 1~2초 풀 스캔**
+- 프로덕션 사용을 위해서는 category, manufacturer, package, stock에 인덱스 추가 필수
 
 ### 가격 정렬 가능 여부
 
@@ -390,31 +441,58 @@ price는 문자열이므로 직접 ORDER BY 불가. 첫 단가를 SQL 런타임�
 
 ### jlcsearch 참고 가능성
 
-tscircuit/jlcsearch는 이 DB와 동일한 원본(yaqwsx/jlcparts)을 사용하며, derived tables를 통해 카테고리별 파라미터를 정규화함:
+tscircuit/jlcsearch는 이 DB와 동일한 원본(yaqwsx/jlcparts)을 사용하며, derived tables를 통해 카테고리별 파라미터를 정규화함.
 
-**Resistor 변환 예시** (jlcsearch 코드):
-```typescript
-// attributes JSON에서 추출
-const rawResistance = extra?.attributes?.["Resistance"]  // "10kΩ"
-const resistance = parseAndConvertSiUnit(rawResistance).value  // 10000
+**중요: jlcsearch의 attributes 데이터 흐름**
 
-// 정규화된 컬럼으로 저장
-resistance: number           // 옴 단위 숫자값
-tolerance_fraction: number   // 0.01 = ±1%
-power_watts: number          // 와트 단위
+jlcsearch의 derived table parser가 읽는 `extra.attributes`는 단순히 `jlc_components.attributes`가 아닙니다. 실제 데이터 흐름:
+
+1. yaqwsx/jlcparts의 `sourceDb.py` → `_rowToComponent()`가 DB에서 부품을 읽을 때:
+   - `jlc_components.attributes` → `jlc_extra.attributes`로 매핑
+   - `lcsc_components.attributes` → `extra.attributes`로 매핑
+
+2. yaqwsx/jlcparts의 `datatables.py` → `_mergeAttributes()`가 두 소스를 병합:
+   ```python
+   def _mergeAttributes(component):
+       attr = dict(_extraAttributes(component.get("extra", {})))   # lcsc_components.attributes (기본)
+       for key, value in _jlcAttributes(component.get("jlc_extra", {})).items():  # jlc_components.attributes
+           if value in ["", "-"]:
+               continue
+           attr[key] = value  # jlc_extra가 extra를 덮어씀 (override)
+       return attr
+   ```
+
+3. 병합된 attributes가 최종 `components` 테이블의 `extra` JSON에 포함됨
+
+4. jlcsearch의 derived table parser (`resistor.ts`, `capacitor.ts` 등)는 이 **병합된 extra.attributes**를 읽음:
+   ```typescript
+   const extra = JSON.parse(c.extra ?? "{}")
+   const rawResistance = extra?.attributes?.["Resistance"]
+   ```
+
+**우리 DB에서의 차이점**:
+
+우리 `jlcpcb-components.sqlite3`에는:
+- `jlc_components.attributes` — JLCPCB API에서 온 속성 (key명: "Resistance", "Power(Watts)" 등)
+- `lcsc_components.attributes` — LCSC 웹에서 온 속성 (key명: 비슷하지만 약간 다름, 예: "DC Resistance" vs "DC Resistance(DCR)")
+
+**jlcsearch parser를 직접 재사용할 경우**:
+- `jlc_components.attributes`만 사용: 대부분의 카테고리에서 주요 파라미터가 포함되어 있으므로 **Resistor, Capacitor 등 기본 카테고리는 동작함**. 단, MCU 등 일부 카테고리에서는 LCSC 측 속성이 더 풍부할 수 있음.
+- `lcsc_components.attributes`와 병합 사용: 원본 jlcparts와 동일한 결과. JOIN으로 구현 가능 (jlc_components의 63%가 lcsc_components에 매핑됨).
+
+**Resistor 예시** (우리 DB의 `jlc_components.attributes` 직접 사용 가능):
+```json
+{"Resistance":"10kΩ","Tolerance":"±1%","Power(Watts)":"100mW","Type":"Thick Film Resistor",...}
 ```
+→ jlcsearch의 `parseAndConvertSiUnit("10kΩ")` → 10000 (바로 적용 가능)
 
-**Capacitor 변환 예시**:
-```typescript
-const rawCapacitance = extra?.attributes?.["Capacitance"]  // "100nF"
-const capacitance = parseAndConvertSiUnit(rawCapacitance).value  // 0.0000001
-
-capacitance_farads: number   // 패럿 단위
-voltage_rating: number       // 볼트 단위
-temperature_coefficient: string  // "X7R", "C0G" 등
+**Capacitor 예시** (우리 DB의 `jlc_components.attributes` 직접 사용 가능):
+```json
+{"Capacitance":"100nF","Voltage Rating":"50V","Temperature Coefficient":"X7R","Tolerance":"±10%"}
 ```
+→ jlcsearch의 `parseAndConvertSiUnit("100nF")` → 0.0000001 (바로 적용 가능)
 
-**결론**: jlcsearch의 derived table 구조와 SI unit 파서를 참고하면 카테고리별 파라미터 필터를 구현할 수 있음. 우리 DB의 attributes JSON에 동일한 key가 사용되므로 변환 로직을 그대로 활용 가능.
+**결론**: jlcsearch의 SI unit 파서와 카테고리별 key 매핑은 `jlc_components.attributes`에 직접 적용 가능하나, 일부 카테고리에서는 병합된 데이터를 쓸 때보다 속성이 빠져있을 수 있음. 나중에 파라미터 필터를 구현할 때 카테고리별로 `jlc_components.attributes`만으로 충분한지 검증이 필요함.
 
 ---
 
@@ -430,11 +508,11 @@ temperature_coefficient: string  // "X7R", "C0G" 등
 
 ### 카테고리 탐색 구현에 문제가 없는가?
 
-**문제 없음**. category/subcategory 필터는 0.1~0.3ms로 매우 빠름. 92개 category, 706개 subcategory 체계가 잘 갖춰져 있음. 단, 빈 category가 117,854건(18.6%)인 점 주의.
+**데이터 측면에서는 문제 없음**. 92개 category, 706개 subcategory 체계가 잘 갖춰져 있음. 단, 빈 category가 117,854건(18.6%)인 점 주의. **성능 측면에서는 인덱스 필요** — category 필터도 풀 스캔이므로, 결과 수 표시나 정렬이 필요하면 1초 이상. 인덱스를 추가하면 해결됨.
 
 ### 정렬/페이징 구현에 문제가 없는가?
 
-**부분적 문제**. LIMIT/OFFSET은 정상. 하지만 ORDER BY stock이나 가격 정렬은 인덱스 없어 1초 이상. 인덱스 추가 필요.
+**문제 있음**. LIMIT/OFFSET 자체는 동작하나, 큰 OFFSET(5만+)에서 700ms~1.2초. ORDER BY stock/price는 항상 풀 스캔 (1~2초). 모든 쿼리가 SCAN jlc_components (인덱스 없음). 프로덕션 수준의 응답을 위해 인덱스 추가 필수.
 
 ### 파라미터 필터를 만들기 위해 추가 처리가 어느 정도 필요한가?
 
@@ -443,7 +521,7 @@ temperature_coefficient: string  // "X7R", "C0G" 등
 2. 단위 포함 값을 숫자로 파싱 ("10kΩ" → 10000)
 3. 정규화된 컬럼으로 별도 테이블 또는 인덱스 생성
 
-이 과정이 필요함. 45개 카테고리에 대해 jlcsearch가 이미 구현한 코드를 참고할 수 있음.
+이 과정이 필요함. 45개 카테고리에 대해 jlcsearch가 이미 구현한 코드를 참고할 수 있으나, jlcsearch는 `jlc_components.attributes`와 `lcsc_components.attributes`를 병합한 데이터를 사용한다는 점 주의. 우리 DB에서는 `jlc_components.attributes`만으로도 Resistor/Capacitor 등 주요 카테고리의 핵심 파라미터가 포함되어 있으므로 MVP 단계에서는 충분하나, 일부 카테고리에서는 `lcsc_components.attributes`와의 JOIN 병합이 필요할 수 있음.
 
 ### 다음 STEP에서 가장 먼저 해야 할 일 하나
 

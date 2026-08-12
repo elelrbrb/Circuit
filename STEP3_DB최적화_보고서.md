@@ -47,11 +47,36 @@ INSERT INTO jlc_components_fts(jlc_components_fts) VALUES('rebuild');
 | LM1117 | 35 | 0.5ms | 1,797ms | 1,402x |
 | "USB-C" | 1 | 3.9ms | — | — |
 
-### FTS 토큰화 문제
+### FTS 토큰화와 MPN 검색 문제
 
-`STM32F103`이 FTS에서 0 결과를 반환하는 이유: 현재 FTS5의 기본 토크나이저(`unicode61`)가 `STM32F103`을 `stm`, `32`, `f`, `103` 등으로 분리할 수 있음. LIKE에서는 65건이 매치되므로 데이터는 존재함. FTS5의 기본 토크나이저가 알파벳+숫자 혼합 MPN에 대해 불완전하게 동작하는 한계.
+`STM32F103`이 FTS에서 0 결과를 반환하는 원인 (실증 확인):
 
-LIKE에서 `STM32F103`은 mfr 컬럼에서 매치되지만, FTS는 토큰 분리 방식에 따라 전체 문자열 매칭이 안 될 수 있음. `ESP32`나 `LM1117`처럼 짧은 토큰은 정상 매치됨.
+`unicode61` 토크나이저는 문자와 숫자를 **분리하지 않음**. "STM32F103C8T6" 전체가 하나의 token(`stm32f103c8t6`)으로 저장됨. `fts5vocab`으로 확인한 결과:
+
+```
+term='stm32f103c8t6'  doc_count=3   ← 전체 MPN이 하나의 token
+term='stm32f103'      (존재하지 않음) ← "STM32F103"이라는 독립 token 없음
+```
+
+따라서 `MATCH 'STM32F103'`은 **정확한 token 매칭**을 시도하지만, 해당 token이 인덱스에 존재하지 않으므로 0건. DB에 있는 token은 `stm32f103c8t6`, `stm32f103vft6`, `stm32f103rgt6` 등 전체 MPN임.
+
+**해결: prefix query (`*` 사용)**
+
+| 쿼리 | 결과 수 | 시간 |
+|------|:------:|:----:|
+| `MATCH 'STM32F103'` | 0 | 2.2ms |
+| `MATCH 'STM32F103*'` (prefix) | 65 | 0.4ms |
+| `MATCH 'STM32F103C8T6'` (정확) | 3 | 0.2ms |
+| `MATCH 'STM32*'` (prefix) | 1,230 | 1.3ms |
+| `MATCH 'ESP32*'` (prefix) | 94 | 1.4ms |
+| `MATCH 'LM1117*'` (prefix) | 112 | 1.1ms |
+
+prefix query(`*`)를 사용하면 LIKE와 동일한 65건을 찾으며 속도도 0.4~1.4ms로 매우 빠름.
+
+**프로덕션에서의 대응**:
+- 검색 입력에 자동으로 `*`을 붙여 prefix query로 실행하는 것이 가장 단순한 해결책
+- 또는 FTS5 prefix index (`prefix='2,3,4'` 옵션)를 추가하면 prefix 검색이 더 빨라질 수 있음 (현재도 충분히 빠르므로 당장 필요하지는 않음)
+- trigram tokenizer 등으로 재설계하면 부분 문자열 검색도 가능하지만, 현재 스키마의 prefix query로 충분히 실용적
 
 ### FTS + JOIN 사용
 
@@ -68,8 +93,9 @@ ORDER BY j.stock DESC LIMIT 5
 
 - **기존 FTS 구조를 rebuild하면 정상 작동함**
 - 대부분의 키워드에서 **1000x 이상 성능 향상**
-- 단, 알파벳+숫자 혼합 MPN (STM32F103 등)에서 토큰화 문제가 있음
-- 프로덕션에서는 `tokenize='unicode61 tokenchars "0123456789"'` 등으로 커스텀 토크나이저 설정이 필요할 수 있음
+- 정확 token 매칭(`MATCH 'STM32F103'`)은 해당 문자열이 독립 token으로 존재할 때만 동작
+- MPN 검색에서는 **prefix query(`MATCH 'STM32F103*'`)**를 사용하면 LIKE와 동일한 결과를 0.4ms에 반환
+- 프로덕션에서는 사용자 입력에 `*`을 자동 추가하여 prefix query로 실행하는 것이 가장 단순하고 효과적
 
 ---
 
@@ -163,7 +189,7 @@ CREATE INDEX idx_cat_price ON jlc_components(category, first_price);
 
 ### 기존 FTS를 rebuild해서 그대로 사용할 수 있는가?
 
-**부분적 사용 가능**. rebuild 자체는 정상 동작하며 대부분의 키워드 검색에서 1000x 이상 성능 향상. 단, 현재 FTS 스키마의 기본 토크나이저가 MPN (예: STM32F103)을 제대로 매칭하지 못하는 문제가 있음. 프로덕션에서는 커스텀 토크나이저 또는 FTS 스키마 재설계가 필요할 수 있지만, MVP 단계에서는 현재 FTS + LIKE fallback 조합으로 사용 가능.
+**사용 가능**. rebuild 자체는 정상 동작하며 대부분의 키워드 검색에서 1000x 이상 성능 향상. `unicode61` 토크나이저는 MPN 전체(예: "STM32F103C8T6")를 하나의 token으로 저장하므로, 부분 MPN 검색(예: "STM32F103")은 prefix query(`MATCH 'STM32F103*'`)로 실행해야 함. prefix query는 0.4~1.4ms로 충분히 빠르므로, 프로덕션에서 사용자 입력에 `*`을 자동 추가하는 방식으로 대응 가능. 현재 FTS 스키마를 재설계할 필요 없음.
 
 ### 어떤 일반 index가 실제로 필요한가?
 

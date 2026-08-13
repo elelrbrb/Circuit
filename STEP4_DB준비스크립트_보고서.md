@@ -43,16 +43,28 @@ python scripts/prepare_db.py ^
 - 원본 DB는 절대 수정하지 않음 (파일 복사 후 복사본만 변경)
 - 원본과 출력 경로가 같으면 에러 출력 후 중단
 - `IF NOT EXISTS`로 인덱스 중복 생성 방지
-- `first_price` 컬럼 이미 존재 시 감지하여 건너뜀
-- FTS 이미 채워져 있으면 rebuild 건너뜀
+- `first_price` 컬럼 이미 존재 시 감지 → 미처리 row(`price != '' AND first_price IS NULL`)만 UPDATE
+- UPDATE 후 검증: 미처리 row가 0인지 확인, 비정상 price 값 보고
+- FTS 상태 검증: `jlc_components_fts_docsize` row 수와 `jlc_components` row 수를 비교하여 정상/불완전/비어있음 판별
+- FTS rebuild 후 재검증: docsize == jlc_components row 수 일치 확인
 - 각 단계 실패 시 명확한 에러 메시지
+
+### 자동 검증 (correctness + 성능 + index 사용)
+
+검증 항목:
+- FTS 검색: 결과 > 0 확인 (0건이면 WRONG)
+- COUNT 쿼리: 결과 > 0 확인
+- 정렬 쿼리: 5건 반환 + 값 NOT NULL 확인
+- 실행 시간 100ms 초과 시 SLOW
+- EXPLAIN QUERY PLAN: 기대하는 쿼리에서 INDEX 미사용 시 FAIL
+- 모든 검증 통과해야 ALL PASS (exit code 0)
 
 ---
 
 ## 실행 결과
 
 ```
-[prepare_db] 총 소요 시간: 111.5초
+[prepare_db] 총 소요 시간: 94.6초
 [prepare_db] 원본 크기: 2088.8 MB
 [prepare_db] 출력 크기: 2316.4 MB (+227.6 MB, +10.9%)
 [prepare_db] 부품 수: 633,341
@@ -61,27 +73,30 @@ python scripts/prepare_db.py ^
 
 ### 검증 결과
 
-| 테스트 | 결과 | 실행 시간 |
-|--------|:----:|:---------:|
-| FTS: STM32F103* | 65건 | 3.6ms |
-| FTS: ESP32* | 94건 | 1.1ms |
-| category COUNT (Capacitors) | 49,350건 | 15.0ms |
-| manufacturer (TI) | 21,193건 | 4.0ms |
-| stock DESC LIMIT 5 | OK | 0.4ms |
-| category + stock DESC | OK | 0.7ms |
-| category + first_price ASC | OK | 0.3ms |
+| 테스트 | 상태 | 결과 | 실행 시간 | 검증 조건 |
+|--------|:----:|------|:---------:|----------|
+| FTS: STM32F103* | PASS | 65건 | 4.0ms | 결과 > 0 |
+| FTS: ESP32* | PASS | 94건 | 1.2ms | 결과 > 0 |
+| category COUNT (Capacitors) | PASS | 49,350건 | 11.8ms | 결과 > 0 |
+| manufacturer (TI) | PASS | 21,193건 | 4.2ms | 결과 > 0 |
+| stock DESC LIMIT 5 | PASS | OK | 0.2ms | 5건, stock NOT NULL |
+| category + stock DESC | PASS | OK | 0.3ms | 5건, stock NOT NULL |
+| category + first_price ASC | PASS | OK | 0.2ms | 5건, first_price NOT NULL |
 
 ### EXPLAIN QUERY PLAN
 
-| 쿼리 | 사용 인덱스 |
-|------|------------|
-| category COUNT | COVERING INDEX idx_cat_price |
-| manufacturer | COVERING INDEX idx_manufacturer |
-| stock DESC | COVERING INDEX idx_stock |
-| cat+stock DESC | COVERING INDEX idx_cat_stock |
-| cat+price ASC | COVERING INDEX idx_cat_price |
+| 쿼리 | 상태 | 사용 인덱스 |
+|------|:----:|------------|
+| category COUNT | PASS | COVERING INDEX idx_cat_price |
+| manufacturer | PASS | COVERING INDEX idx_manufacturer |
+| stock DESC | PASS | COVERING INDEX idx_stock |
+| cat+stock DESC | PASS | COVERING INDEX idx_cat_stock |
+| cat+price ASC | PASS | COVERING INDEX idx_cat_price |
 
-모든 주요 쿼리가 COVERING INDEX를 사용하여 테이블 본체를 읽지 않음.
+### first_price 검증
+
+- 미처리 row (price != '' AND first_price IS NULL): **0건**
+- 비정상 price 값: 없음
 
 ---
 

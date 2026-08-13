@@ -57,13 +57,9 @@ def check_index_exists(conn, index_name):
     return cur.fetchone()[0] > 0
 
 
-def check_fts_populated(conn):
-    """FTS docsize 테이블에 데이터가 있으면 인덱스가 채워진 것"""
-    try:
-        cur = conn.execute("SELECT COUNT(*) FROM jlc_components_fts_docsize")
-        return cur.fetchone()[0] > 0
-    except Exception:
-        return False
+def get_row_count(conn, table_name):
+    cur = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]")
+    return cur.fetchone()[0]
 
 
 def step_copy_db(source_path, output_path):
@@ -81,8 +77,7 @@ def step_validate_source(conn):
     if not check_table_exists(conn, "jlc_components"):
         error_exit("jlc_components 테이블이 존재하지 않습니다.")
 
-    cur = conn.execute("SELECT COUNT(*) FROM jlc_components")
-    row_count = cur.fetchone()[0]
+    row_count = get_row_count(conn, "jlc_components")
     if row_count == 0:
         error_exit("jlc_components 테이블이 비어있습니다.")
 
@@ -95,12 +90,22 @@ def step_validate_source(conn):
     return row_count
 
 
-def step_rebuild_fts(conn):
-    log("FTS5 인덱스 rebuild...")
+def step_rebuild_fts(conn, expected_row_count):
+    log("FTS5 인덱스 확인 및 rebuild...")
 
-    if check_fts_populated(conn):
-        log("  FTS 이미 채워져 있음 — 재구축 건너뜀")
+    # FTS 상태 확인: docsize row 수와 jlc_components row 수 비교
+    try:
+        fts_docsize_count = get_row_count(conn, "jlc_components_fts_docsize")
+    except Exception:
+        fts_docsize_count = 0
+
+    if fts_docsize_count == expected_row_count:
+        log(f"  FTS 정상 (docsize={fts_docsize_count:,} == jlc_components={expected_row_count:,}) — rebuild 건너뜀")
         return
+    elif fts_docsize_count > 0:
+        log(f"  FTS 불완전 (docsize={fts_docsize_count:,} != jlc_components={expected_row_count:,}) — rebuild 실행")
+    else:
+        log(f"  FTS 비어있음 (docsize=0) — rebuild 실행")
 
     t0 = time.perf_counter()
     conn.execute(
@@ -110,10 +115,14 @@ def step_rebuild_fts(conn):
     elapsed = time.perf_counter() - t0
     log(f"  FTS rebuild 완료 ({elapsed:.1f}초)")
 
-    # 확인
-    cur = conn.execute("SELECT COUNT(*) FROM jlc_components_fts_docsize")
-    docsize = cur.fetchone()[0]
-    log(f"  FTS docsize rows: {docsize:,}")
+    # rebuild 후 검증
+    fts_docsize_after = get_row_count(conn, "jlc_components_fts_docsize")
+    if fts_docsize_after != expected_row_count:
+        error_exit(
+            f"FTS rebuild 후 docsize({fts_docsize_after:,}) != "
+            f"jlc_components({expected_row_count:,})"
+        )
+    log(f"  FTS 검증 통과 (docsize={fts_docsize_after:,})")
 
 
 def step_create_indexes(conn):
@@ -141,34 +150,24 @@ def step_create_indexes(conn):
 def step_add_first_price(conn):
     log("first_price 컬럼 및 인덱스 생성...")
 
-    # 컬럼 추가
-    if check_column_exists(conn, "jlc_components", "first_price"):
-        # 이미 존재하면 값이 채워져 있는지 확인
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM jlc_components WHERE first_price IS NOT NULL"
-        )
-        filled = cur.fetchone()[0]
-        if filled > 0:
-            log(f"  first_price 이미 존재하고 {filled:,}건 채워짐 — 건너뜀")
-        else:
-            log("  first_price 컬럼 존재하지만 비어있음 — UPDATE 실행")
-            t0 = time.perf_counter()
-            conn.execute("""
-                UPDATE jlc_components SET first_price =
-                    CAST(substr(price, instr(price,':')+1,
-                         CASE WHEN instr(price,',') > 0
-                              THEN instr(price,',')-instr(price,':')-1
-                              ELSE length(price)-instr(price,':')
-                         END) AS REAL)
-                WHERE price != '' AND first_price IS NULL
-            """)
-            conn.commit()
-            elapsed = time.perf_counter() - t0
-            log(f"  UPDATE 완료 ({elapsed:.1f}초)")
-    else:
+    # 컬럼 추가 (없으면)
+    if not check_column_exists(conn, "jlc_components", "first_price"):
         log("  first_price 컬럼 추가...")
         conn.execute("ALTER TABLE jlc_components ADD COLUMN first_price REAL")
+        conn.commit()
+    else:
+        log("  first_price 컬럼 이미 존재")
 
+    # 미처리 row 확인
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM jlc_components WHERE price != '' AND first_price IS NULL"
+    )
+    remaining = cur.fetchone()[0]
+
+    if remaining == 0:
+        log("  first_price 모든 row 처리 완료 — UPDATE 건너뜀")
+    else:
+        log(f"  first_price 미처리 row: {remaining:,}개 — UPDATE 실행")
         t0 = time.perf_counter()
         conn.execute("""
             UPDATE jlc_components SET first_price =
@@ -177,11 +176,29 @@ def step_add_first_price(conn):
                           THEN instr(price,',')-instr(price,':')-1
                           ELSE length(price)-instr(price,':')
                      END) AS REAL)
-            WHERE price != ''
+            WHERE price != '' AND first_price IS NULL
         """)
         conn.commit()
         elapsed = time.perf_counter() - t0
-        log(f"  UPDATE 완료 ({elapsed:.1f}초)")
+        log(f"  UPDATE 완료 ({elapsed:.1f}초, {remaining:,}건 처리)")
+
+    # UPDATE 후 검증: price가 있는데 first_price가 여전히 NULL인 row
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM jlc_components WHERE price != '' AND first_price IS NULL"
+    )
+    still_null = cur.fetchone()[0]
+    if still_null > 0:
+        log(f"  [경고] price != '' 인데 first_price IS NULL인 row: {still_null}개")
+        # 원인 조사: price 값이 비정상인 경우
+        cur = conn.execute("""
+            SELECT lcsc, price FROM jlc_components
+            WHERE price != '' AND first_price IS NULL
+            LIMIT 5
+        """)
+        for r in cur.fetchall():
+            log(f"    C{r[0]}: price='{r[1][:80]}'")
+    else:
+        log("  first_price 검증 통과 (미처리 row 0건)")
 
     # 인덱스
     price_indexes = [
@@ -212,43 +229,80 @@ def step_verify(conn):
     log("최종 검증...")
     print()
 
+    all_pass = True
+
+    # --- correctness + 성능 검증 ---
     tests = [
-        ("FTS: STM32F103*",
-         "SELECT COUNT(*) FROM jlc_components_fts WHERE jlc_components_fts MATCH 'STM32F103*'"),
-        ("FTS: ESP32*",
-         "SELECT COUNT(*) FROM jlc_components_fts WHERE jlc_components_fts MATCH 'ESP32*'"),
-        ("category COUNT (Capacitors)",
-         "SELECT COUNT(*) FROM jlc_components WHERE category='Capacitors'"),
-        ("manufacturer (TI)",
-         "SELECT COUNT(*) FROM jlc_components WHERE manufacturer='Texas Instruments'"),
-        ("stock DESC LIMIT 5",
-         "SELECT lcsc FROM jlc_components ORDER BY stock DESC LIMIT 5"),
-        ("category + stock DESC",
-         "SELECT lcsc FROM jlc_components WHERE category='Capacitors' ORDER BY stock DESC LIMIT 5"),
-        ("category + first_price ASC",
-         "SELECT lcsc FROM jlc_components WHERE category='Capacitors' ORDER BY first_price ASC LIMIT 5"),
+        {
+            "label": "FTS: STM32F103*",
+            "sql": "SELECT COUNT(*) FROM jlc_components_fts WHERE jlc_components_fts MATCH 'STM32F103*'",
+            "check": lambda rows: rows[0][0] > 0,
+            "desc": "결과 > 0",
+        },
+        {
+            "label": "FTS: ESP32*",
+            "sql": "SELECT COUNT(*) FROM jlc_components_fts WHERE jlc_components_fts MATCH 'ESP32*'",
+            "check": lambda rows: rows[0][0] > 0,
+            "desc": "결과 > 0",
+        },
+        {
+            "label": "category COUNT (Capacitors)",
+            "sql": "SELECT COUNT(*) FROM jlc_components WHERE category='Capacitors'",
+            "check": lambda rows: rows[0][0] > 0,
+            "desc": "결과 > 0",
+        },
+        {
+            "label": "manufacturer (TI)",
+            "sql": "SELECT COUNT(*) FROM jlc_components WHERE manufacturer='Texas Instruments'",
+            "check": lambda rows: rows[0][0] > 0,
+            "desc": "결과 > 0",
+        },
+        {
+            "label": "stock DESC LIMIT 5",
+            "sql": "SELECT lcsc, stock FROM jlc_components ORDER BY stock DESC LIMIT 5",
+            "check": lambda rows: len(rows) == 5 and all(r[1] is not None for r in rows),
+            "desc": "5건 반환, stock NOT NULL",
+        },
+        {
+            "label": "category + stock DESC",
+            "sql": "SELECT lcsc, stock FROM jlc_components WHERE category='Capacitors' ORDER BY stock DESC LIMIT 5",
+            "check": lambda rows: len(rows) == 5 and all(r[1] is not None for r in rows),
+            "desc": "5건 반환, stock NOT NULL",
+        },
+        {
+            "label": "category + first_price ASC",
+            "sql": "SELECT lcsc, first_price FROM jlc_components WHERE category='Capacitors' ORDER BY first_price ASC LIMIT 5",
+            "check": lambda rows: len(rows) == 5 and all(r[1] is not None for r in rows),
+            "desc": "5건 반환, first_price NOT NULL",
+        },
     ]
 
-    all_pass = True
-    for label, sql in tests:
+    for t in tests:
         try:
             t0 = time.perf_counter()
-            cur = conn.execute(sql)
+            cur = conn.execute(t["sql"])
             rows = cur.fetchall()
             elapsed = (time.perf_counter() - t0) * 1000
-            result = rows[0][0] if rows else "N/A"
-            status = "PASS" if elapsed < 100 else "SLOW"
-            if status == "SLOW":
+
+            correct = t["check"](rows)
+            fast = elapsed < 100
+            passed = correct and fast
+
+            if not passed:
                 all_pass = False
-            print(f"  [{status}] {label:35s} {elapsed:7.1f}ms  result={result}")
+
+            result_val = rows[0][0] if rows and len(rows[0]) >= 1 else "N/A"
+            status = "PASS" if passed else ("WRONG" if not correct else "SLOW")
+            print(f"  [{status:5s}] {t['label']:35s} {elapsed:7.1f}ms  result={result_val}  ({t['desc']})")
         except Exception as e:
             all_pass = False
-            print(f"  [FAIL] {label:35s} ERROR: {e}")
+            print(f"  [FAIL ] {t['label']:35s} ERROR: {e}")
 
-    # EXPLAIN QUERY PLAN 확인
+    # --- EXPLAIN QUERY PLAN 검증 (index 사용 필수) ---
     print()
-    log("EXPLAIN QUERY PLAN 확인...")
-    explain_queries = [
+    log("EXPLAIN QUERY PLAN 검증 (INDEX 사용 필수)...")
+
+    explain_tests = [
         ("category COUNT",
          "SELECT COUNT(*) FROM jlc_components WHERE category='Capacitors'"),
         ("manufacturer",
@@ -260,12 +314,18 @@ def step_verify(conn):
         ("cat+price ASC",
          "SELECT lcsc FROM jlc_components WHERE category='Capacitors' ORDER BY first_price ASC LIMIT 5"),
     ]
-    for label, sql in explain_queries:
+
+    for label, sql in explain_tests:
         cur = conn.execute(f"EXPLAIN QUERY PLAN {sql}")
         plans = [r[3] for r in cur.fetchall()]
         uses_index = any("INDEX" in p for p in plans)
-        status = "OK" if uses_index else "NO INDEX"
-        print(f"  [{status:8s}] {label:20s} → {plans[0] if plans else 'N/A'}")
+
+        if not uses_index:
+            all_pass = False
+
+        status = "PASS" if uses_index else "FAIL"
+        plan_str = plans[0] if plans else "N/A"
+        print(f"  [{status:5s}] {label:20s} → {plan_str}")
 
     print()
     return all_pass
@@ -305,7 +365,7 @@ def main():
     row_count = step_validate_source(conn)
 
     # 3. FTS rebuild
-    step_rebuild_fts(conn)
+    step_rebuild_fts(conn, row_count)
 
     # 4. 일반 인덱스
     step_create_indexes(conn)
@@ -334,7 +394,7 @@ def main():
     log(f"원본 크기: {original_size / 1024 / 1024:.1f} MB")
     log(f"출력 크기: {final_size / 1024 / 1024:.1f} MB (+{(final_size - original_size) / 1024 / 1024:.1f} MB, +{(final_size - original_size) * 100 / original_size:.1f}%)")
     log(f"부품 수: {row_count:,}")
-    log(f"검증: {'ALL PASS' if all_pass else 'SOME ISSUES'}")
+    log(f"검증: {'ALL PASS' if all_pass else 'FAILED'}")
     log(f"출력: {output_path}")
     print()
 

@@ -3,43 +3,49 @@
 import re
 import time
 import sqlite3
+import logging
 
+logger = logging.getLogger(__name__)
 
-# Characters that have special meaning in FTS5 query syntax
-_FTS_SPECIAL = re.compile(r'["\'\*\(\)\-\+\^~{}:\[\]|&!]')
-# Only allow reasonable characters for search
-_ALLOWED = re.compile(r"[a-zA-Z0-9 ._/]")
+# Token: sequences of alphanumeric + underscore
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
 
 
 def sanitize_query(raw: str) -> str | None:
     """
     Sanitize user input for safe use in FTS5 MATCH.
 
-    Returns a safe FTS5 prefix query string, or None if input is invalid.
+    Strategy:
+    - Extract tokens (alphanumeric + underscore only)
+    - Wrap each token in double quotes to avoid FTS5 operator collision (AND/OR/NOT etc.)
+    - Append * outside quotes for prefix matching (only for tokens longer than 1 char)
+    - Single-char tokens are exact match only (avoid overly broad prefix like "C"*)
+
+    Returns a safe FTS5 query string, or None if input is invalid/empty.
     """
-    # Strip and limit length
     raw = raw.strip()
     if not raw or len(raw) > 200:
         return None
 
-    # Remove FTS special characters
-    cleaned = _FTS_SPECIAL.sub(" ", raw)
-
-    # Split into tokens, keep only alphanumeric tokens
-    tokens = cleaned.split()
-    safe_tokens = []
-    for token in tokens:
-        # Keep only chars that are safe
-        token = "".join(c for c in token if _ALLOWED.match(c))
-        if token and len(token) >= 1:
-            safe_tokens.append(token)
-
-    if not safe_tokens:
+    # Extract alphanumeric tokens
+    tokens = _TOKEN_RE.findall(raw)
+    if not tokens:
         return None
 
-    # Build prefix query: each token gets a * suffix for prefix matching
-    # Multiple tokens are ANDed by default in FTS5
-    return " ".join(f"{t}*" for t in safe_tokens[:5])  # max 5 tokens
+    # Limit to 5 tokens
+    tokens = tokens[:5]
+
+    # Build FTS5 query: each token is double-quoted, prefix * for len > 1
+    parts = []
+    for token in tokens:
+        # Double-quote escaping: double any internal quotes (FTS5 uses "" to escape)
+        escaped = token.replace('"', '""')
+        if len(token) > 1:
+            parts.append(f'"{escaped}"*')
+        else:
+            parts.append(f'"{escaped}"')
+
+    return " ".join(parts)
 
 
 def search_parts(
@@ -52,6 +58,7 @@ def search_parts(
     Search parts using FTS5.
 
     Returns (results list, query_time_ms).
+    Raises on database errors (caller should handle).
     """
     fts_query = sanitize_query(query)
     if fts_query is None:

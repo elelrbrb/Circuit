@@ -83,16 +83,20 @@ FTS MATCH에는 sanitize된 prefix query를 parameter binding으로 전달.
 ## FTS 입력 Escaping 방식
 
 1. 길이 검증 (200자 초과 거부)
-2. FTS5 특수문자 제거: `"` `'` `*` `(` `)` `-` `+` `^` `~` `{` `}` `:` `[` `]` `|` `&` `!`
-3. 안전한 문자만 유지: `[a-zA-Z0-9 ._/]`
-4. 공백으로 분리 → 토큰별 `*` 접미사 추가 (prefix query)
-5. 최대 5 토큰으로 제한
-6. 모든 토큰이 비어있으면 None 반환 → 빈 결과
+2. 정규식으로 alphanumeric + underscore 토큰만 추출 (`[a-zA-Z0-9_]+`)
+3. 각 토큰을 FTS5 double-quoted string으로 래핑 → FTS operator 충돌 방지 (AND/OR/NOT 등)
+4. 2자 이상 토큰: `"token"*` (prefix query)
+5. 1자 토큰: `"token"` (exact match only — 너무 넓은 prefix 방지)
+6. 최대 5 토큰으로 제한
+7. 토큰이 하나도 추출되지 않으면 None → 빈 결과
 
-예: `STM32F103` → `STM32F103*`
-예: `USB-C` → `USB* C*` (하이픈 제거, 두 토큰으로 분리)
-예: `"test"` → `test*` (따옴표 제거)
-예: `*` → None (빈 결과)
+예:
+- `STM32F103` → `"STM32F103"*`
+- `USB-C` → `"USB"* "C"` (하이픈 제거, C는 1자이므로 prefix 없음)
+- `LM1117S-3.3` → `"LM1117S"* "3"` (특수문자에서 분리, 단일 숫자 "3"은 exact)
+- `AND` → `"AND"*` (FTS operator와 충돌 없음)
+- `"` → None (토큰 없음 → 빈 결과)
+- `*` → None (토큰 없음 → 빈 결과)
 
 ---
 
@@ -102,25 +106,44 @@ FTS MATCH에는 sanitize된 prefix query를 parameter binding으로 전달.
 
 | 검색어 | HTTP | 결과 수 | DB 시간 | 첫 결과 |
 |--------|:----:|:------:|:-------:|---------|
-| STM32F103 | 200 | 20 | 4.4ms | C8734 STM32F103C8T6 stock=270,767 |
-| ESP32 | 200 | 20 | 3.8ms | C2913202 ESP32-S3-WROOM-1-N16R8 |
-| LM1117 | 200 | 20 | 2.4ms | C126027 LM1117S-3.3 stock=73,060 |
-| USB-C | 200 | 20 | 345ms | C2765186 TYPE-C 16PIN stock=1,171,811 |
+| STM32F103 | 200 | 20 | 5.9ms | C8734 STM32F103C8T6 |
+| STM32F103C8T6 | 200 | 3 | 0.6ms | C8734 STM32F103C8T6 |
+| ESP32 | 200 | 20 | 2.5ms | C2913202 ESP32-S3-WROOM-1-N16R8 |
+| LM1117 | 200 | 20 | 4.1ms | C126027 LM1117S-3.3 |
+| USB-C | 200 | 20 | **25.7ms** | C2765186 TYPE-C 16PIN |
+| LM1117S-3.3 | 200 | 10 | 6.9ms | C126027 LM1117S-3.3 |
 
-USB-C가 느린 이유: `USB-C` → `USB* C*`로 변환되어 "USB"로 시작하는 모든 부품과 "C"로 시작하는 모든 부품의 교집합을 검색. "C"는 거의 모든 MPN에 포함되므로 범위가 넓어짐. 향후 하이픈을 포함한 복합어 처리를 개선할 수 있음.
+**USB-C 성능 개선**: 이전 345ms → 수정 후 **25.7ms** (13.4x 개선). 원인: `"C"` exact match (prefix 없음)로 변경하여 overly broad 검색 제거.
 
-### 비정상 입력
+### 특수 입력 (FTS operator 등)
+
+| 입력 | HTTP | 동작 | 비고 |
+|------|:----:|------|------|
+| AND | 200 | 20건 반환 | `"AND"*`로 변환, operator 충돌 없음 |
+| OR | 200 | 20건 반환 | `"OR"*`로 변환 |
+| NOT | 200 | 20건 반환 | `"NOT"*`로 변환 |
+| " | 200 | 0건 (빈 결과) | 토큰 추출 불가 → None |
+| * | 200 | 0건 (빈 결과) | 토큰 추출 불가 → None |
+| ( | 200 | 0건 (빈 결과) | 토큰 추출 불가 → None |
+| A/B | 200 | 20건 반환 | `"A" "B"*`로 변환 (A는 1자, B는 1자) |
+| test.test | 200 | 20건 반환 | `"test"* "test"*`로 변환 |
+
+**서버 crash 없음**, 모든 입력에서 FTS syntax error 없음.
+
+### 파라미터 오류
 
 | 입력 | HTTP | 동작 |
 |------|:----:|------|
-| q= (빈값) | 200 | 빈 결과 반환 |
-| q=" (따옴표만) | 200 | 빈 결과 (특수문자 제거 후 빈 토큰) |
-| q=* (별표만) | 200 | 빈 결과 |
-| q=STM32F103" | 200 | 20건 정상 반환 (따옴표 제거됨) |
 | limit=10000 | 422 | FastAPI 자동 검증 (le=100 초과) |
 | offset=-1 | 422 | FastAPI 자동 검증 (ge=0 미달) |
 
-**서버 crash 없음**, 모든 비정상 입력에 대해 안전한 응답.
+### 에러 응답 구분
+
+| 상황 | HTTP | 응답 |
+|------|:----:|------|
+| 정상 검색 결과 0건 | 200 | `{"returnedCount": 0, "items": []}` |
+| DB/검색 내부 오류 | 500 | `{"error": "Internal search error..."}` |
+| 파라미터 검증 실패 | 422 | FastAPI 자동 에러 응답 |
 
 ---
 
@@ -131,8 +154,8 @@ USB-C가 느린 이유: `USB-C` → `USB* C*`로 변환되어 "USB"로 시작하
   "query": "STM32F103",
   "limit": 20,
   "offset": 0,
-  "total": 20,
-  "queryTimeMs": 4.4,
+  "returnedCount": 20,
+  "queryTimeMs": 5.9,
   "items": [
     {
       "lcsc": 8734,
@@ -157,22 +180,26 @@ USB-C가 느린 이유: `USB-C` → `USB* C*`로 변환되어 "USB"로 시작하
 
 ## DB Query 실행시간
 
-| 검색어 | DB query 시간 |
-|--------|:-------------:|
-| STM32F103 | 4.4ms |
-| ESP32 | 3.8ms |
-| LM1117 | 2.4ms |
-| USB-C | 345ms (토큰 분리 문제) |
+| 검색어 | DB query 시간 | 비고 |
+|--------|:-------------:|------|
+| STM32F103 | 5.9ms | prefix query |
+| STM32F103C8T6 | 0.6ms | exact token match |
+| ESP32 | 2.5ms | prefix query |
+| LM1117 | 4.1ms | prefix query |
+| USB-C | 25.7ms | "USB"* "C" (C는 exact, 이전 345ms에서 개선) |
+| LM1117S-3.3 | 6.9ms | "LM1117S"* "3" |
 
-STEP 3에서 검증한 FTS 성능 (0.4~1.4ms)이 backend를 거쳐서도 유지됨 (단일 토큰 검색 기준 2~5ms). 차이는 JOIN + ORDER BY stock DESC + LIMIT/OFFSET 처리 시간.
+STEP 3에서 검증한 FTS 성능이 backend를 거쳐서도 유지됨. JOIN + ORDER BY stock DESC + LIMIT/OFFSET 포함하여 단일 토큰 기준 1~6ms.
 
 ---
 
 ## 최종 판단
 
 - 검색 API가 정상 동작함
-- FTS5 prefix query로 MPN 검색이 실용적 속도 (2~5ms)
-- 입력 sanitization으로 SQL injection과 FTS query error 방지됨
-- FastAPI의 자동 파라미터 검증으로 range 오류 처리됨
+- FTS5 double-quoted prefix query로 MPN 검색이 실용적 속도 (1~6ms)
+- double-quote 래핑으로 AND/OR/NOT 등 FTS operator 충돌 완전 방지
+- 단일 문자 토큰에 prefix 없음으로 overly broad 검색 방지 (USB-C: 345ms → 25.7ms)
+- parameter binding + 토큰 추출 방식으로 SQL injection/FTS error 방지
+- FastAPI 자동 파라미터 검증으로 range 오류 처리
+- 예외 처리: 정상 0건(200) vs 서버 오류(500) 명확히 구분
 - 2GB SQLite를 read-only로 안정적으로 서빙 가능
-- USB-C 같은 하이픈 포함 복합어는 향후 개선 여지 있음
